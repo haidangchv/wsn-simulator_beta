@@ -1,0 +1,64 @@
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Union
+
+
+NodeId = Union[int, str]
+
+
+@dataclass
+class Packet:
+    source_id: int
+
+    sequence_number: int
+
+    sensor_type: str
+
+    payload_size_bytes: int
+
+    created_round: int
+
+    measurement_value: float | None = None
+
+    measurement_unit: str | None = None
+
+    simulation_time_seconds: float = 0.0
+
+    simulation_datetime: datetime | None = None
+
+    raw_payload_size_bytes: int | None = None
+
+    encoded_payload_size_bytes: int | None = None
+
+    compressed_payload_size_bytes: int | None = None
+
+    delivered: bool = False
+
+    dropped_reason: str | None = None
+
+    hop_count: int = 0
+
+    delay_ms: float = 0.0
+
+    transmission_time_ms: float = 0.0
+
+    processing_delay_ms: float = 0.0
+
+    propagation_delay_ms: float = 0.0
+
+    route: list[NodeId] = field(
+        default_factory=list
+    )
+
+    # -------------------------------------------------------------
+    # Lightweight Packet Encryption metadata
+    # -------------------------------------------------------------
+    is_encrypted: bool = False
+
+    ciphertext: bytes | None = None
+
+    auth_tag_bytes: int = 0
+
+    crypto_delay_ms: float = 0.0
+
+    crypto_verified: bool | None = None
