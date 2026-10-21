@@ -83,26 +83,7 @@ Bảng thông số tham khảo được sử dụng cho thiết kế và cần �
 | Thuật toán đối chứng | Minimum-Hop |
 | Thuật toán đề xuất | LB-ECMHR |
 
-```
-PHÂN BỐ SENSOR, SINK VÀ MẠNG KẾT NỐI LÁNG GIỀNG
-┌────────────────────────────────────────────────────────┐
-│ (0, 2000)                                (2000, 2000)  │
-│      o       o---o          o           o              │
-│       \     /     \        / \         /               │
-│        o---o       o------o   o-------o                │
-│             \     /        \ /                         │
-│              o---o    ┌───────────┐                    │
-│             /     \   │  Vành đai │    o---o           │
-│      o-----o       o  │   Relay   │   /     \          │
-│             \       \ │  🎯 SINK  │--o       o         │
-│              o-------o│(1000,1000)│   \     /          │
-│                       └───────────┘    o---o           │
-│        o-------o          o           /                │
-│       /         \        / \         o                 │
-│      o           o------o   o                          │
-│ (0, 0)                                      (2000, 0)  │
-└────────────────────────────────────────────────────────┘
-```
+![Hình 1: Mô hình mạng WSN được sử dụng để thực nghiệm thuật toán định tuyến](figures/hinh1_wsn_topology.png)
 *Hình 1. Mô hình mạng WSN được sử dụng để thực nghiệm thuật toán định tuyến.*
 
 ---
