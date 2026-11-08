@@ -92,6 +92,12 @@ class RouteManager:
                     "recovery_factor",
                     1.2
                 )
+            ),
+            hysteresis_enabled=bool(
+                lb_config.get(
+                    "hysteresis_enabled",
+                    True
+                )
             )
         )
 
@@ -109,9 +115,31 @@ class RouteManager:
             )
         )
 
+        self.load_balancing_enabled = bool(
+            lb_config.get(
+                "load_balancing_enabled",
+                True
+            )
+        )
+
+        self.allow_low_energy_fallback = bool(
+            lb_config.get(
+                "allow_low_energy_fallback",
+                False
+            )
+        )
+
+        self.soft_energy_threshold_ratio = float(
+            lb_config.get(
+                "soft_energy_threshold_ratio",
+                0.01
+            )
+        )
+
         self.last_build_round = -999
         self.prev_overloaded_nodes = set()
         self.prev_low_energy_nodes = set()
+        self.prev_soft_depleted_nodes = set()
         self.prev_dead_nodes = set()
         self._round_counter = 0
 
@@ -132,6 +160,9 @@ class RouteManager:
                     True
                 )
             ),
+            load_balancing_enabled=self.load_balancing_enabled,
+            allow_low_energy_fallback=self.allow_low_energy_fallback,
+            soft_energy_threshold_ratio=self.soft_energy_threshold_ratio,
             candidate_k=self.candidate_routes_per_source
         )
 
@@ -161,26 +192,20 @@ class RouteManager:
         self.last_build_round = -999
         self.prev_overloaded_nodes = set()
         self.prev_low_energy_nodes = set()
+        self.prev_soft_depleted_nodes = set()
         self.prev_dead_nodes = set()
 
     def _active_minimum_hop_graph(self):
 
-        graph = (
-            self.network.graph.copy()
-        )
-
-        dead_nodes = [
+        alive_nodes = {
             sensor.node_id
             for sensor
             in self.network.sensors
-            if not sensor.is_alive()
-        ]
+            if sensor.is_alive()
+        }
+        alive_nodes.add(self.network.sink.node_id)
 
-        graph.remove_nodes_from(
-            dead_nodes
-        )
-
-        return graph
+        return self.network.graph.subgraph(alive_nodes)
 
     def _build_minimum_hop_table(self):
 
@@ -229,6 +254,12 @@ class RouteManager:
         }
         node_died = (dead_nodes != self.prev_dead_nodes)
 
+        # Always update load_tracker so post-hoc sliding-window load CV
+        # is recorded on an identical window across Minimum-Hop, EC-only, and LB-ECMHR.
+        self.load_tracker.update(
+            self.network.sensors
+        )
+
         if (
             self.algorithm
             == "minimum_hop"
@@ -253,13 +284,10 @@ class RouteManager:
             self.algorithm
             == "lb_ecmhr"
         ):
-            # Load reflects preceding rounds
-            self.load_tracker.update(
-                self.network.sensors
-            )
-
-            overloaded_nodes = set(
-                self.load_tracker.overloaded_nodes
+            overloaded_nodes = (
+                set(self.load_tracker.overloaded_nodes)
+                if self.load_balancing_enabled
+                else set()
             )
             low_energy_nodes = {
                 sensor.node_id
@@ -271,12 +299,32 @@ class RouteManager:
                     <= self.energy_threshold_ratio
                 )
             }
+            soft_depleted_nodes = {
+                sensor.node_id
+                for sensor
+                in self.network.sensors
+                if sensor.is_alive()
+                and (
+                    sensor.energy_ratio()
+                    <= self.soft_energy_threshold_ratio
+                )
+            }
 
             overload_state_changed = (
                 overloaded_nodes != self.prev_overloaded_nodes
             )
             energy_state_changed = (
                 low_energy_nodes != self.prev_low_energy_nodes
+                or soft_depleted_nodes != self.prev_soft_depleted_nodes
+            )
+            any_soft_fallback_active = (
+                self.allow_low_energy_fallback
+                and self.load_balancing_enabled
+                and any(
+                    getattr(r, "used_low_energy_fallback", False)
+                    for r in self.route_table.values()
+                    if r is not None
+                )
             )
             interval_elapsed = (
                 (current_round - self.last_build_round)
@@ -288,6 +336,7 @@ class RouteManager:
                 or interval_elapsed
                 or overload_state_changed
                 or energy_state_changed
+                or any_soft_fallback_active
                 or node_died
             )
 
@@ -308,6 +357,7 @@ class RouteManager:
                 self.last_build_round = current_round
                 self.prev_overloaded_nodes = overloaded_nodes
                 self.prev_low_energy_nodes = low_energy_nodes
+                self.prev_soft_depleted_nodes = soft_depleted_nodes
                 self.prev_dead_nodes = dead_nodes
             return
 
@@ -342,6 +392,15 @@ class RouteManager:
 
         # Intermediate nodes (relays) only
         relay_ids = route.path[1:-1]
+        is_soft_route = (
+            self.allow_low_energy_fallback
+            and getattr(route, "used_low_energy_fallback", False)
+        )
+        eff_thr = (
+            self.soft_energy_threshold_ratio
+            if is_soft_route
+            else self.energy_threshold_ratio
+        )
 
         for relay_id in relay_ids:
 
@@ -362,7 +421,7 @@ class RouteManager:
 
                 if (
                     relay.energy_ratio()
-                    <= self.energy_threshold_ratio
+                    <= eff_thr
                 ):
 
                     return False

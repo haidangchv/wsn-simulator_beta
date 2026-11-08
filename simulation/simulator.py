@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import math
 from math import ceil
 import time
 import networkx as nx
@@ -131,13 +132,31 @@ class WSNSimulator:
         self.generated_packets = 0
         self.delivered_packets = 0
         self.dropped_packets = 0
+        self.drop_reasons = {
+            "SOURCE_DEAD": 0,
+            "NO_ROUTE": 0,
+            "NO_ROUTE_ENERGY_THRESHOLD": 0,
+            "NO_ROUTE_PHYSICAL_PARTITION": 0,
+            "TX_ENERGY_INSUFFICIENT": 0,
+            "RX_ENERGY_INSUFFICIENT": 0,
+            "CRYPTO_AUTH_FAILURES": 0
+        }
 
         self.generated_bytes = 0
         self.delivered_bytes = 0
 
         self.total_energy_consumed_j = 0.0
+        self.radio_energy_consumed_j = 0.0
+        self.basal_energy_consumed_j = 0.0
         self.total_delay_ms = 0.0
         self.total_delivered_hops = 0
+
+        self.full_conn_delivered_packets = 0
+        self.full_conn_total_hops = 0
+        self.full_conn_total_delay_ms = 0.0
+        self.total_detour_packets = 0
+        self.total_soft_fallback_packets = 0
+        self.functional_50_round = None
 
         self.clock = SimulationClock(
             config
@@ -314,6 +333,17 @@ class WSNSimulator:
         self.crypto_total_enc_time_ms = 0.0
         self.crypto_total_dec_time_ms = 0.0
         self.crypto_cpu_energy_j = 0.0
+
+        # ---------------------------------------------------------
+        # Basal Idle / Sensing / Beacon Energy per Active Round
+        # ---------------------------------------------------------
+        energy_cfg = config.get("energy", {})
+        self.idle_energy_per_round_j = float(
+            energy_cfg.get("idle_energy_per_round_j", 0.0)
+        )
+        self.beacon_energy_per_round_j = float(
+            energy_cfg.get("beacon_energy_per_round_j", 0.0)
+        )
 
 
     def _active_graph(self) -> nx.Graph:
@@ -569,7 +599,8 @@ class WSNSimulator:
     def _consume_sensor_energy(
         self,
         sensor_id: int,
-        amount_j: float
+        amount_j: float,
+        is_basal: bool = False
     ) -> float:
 
         sensor = self.sensor_map[
@@ -593,6 +624,10 @@ class WSNSimulator:
         self.total_energy_consumed_j += (
             actual_consumed
         )
+        if is_basal:
+            self.basal_energy_consumed_j += actual_consumed
+        else:
+            self.radio_energy_consumed_j += actual_consumed
 
         if (
             was_alive
@@ -666,6 +701,7 @@ class WSNSimulator:
             )
 
             self.dropped_packets += 1
+            self.drop_reasons["SOURCE_DEAD"] += 1
 
             return TransmissionResult(
                 packet=packet,
@@ -685,6 +721,11 @@ class WSNSimulator:
             )
 
             self.dropped_packets += 1
+            self.drop_reasons["NO_ROUTE"] += 1
+            if source_id in self._get_physical_connected_ids():
+                self.drop_reasons["NO_ROUTE_ENERGY_THRESHOLD"] += 1
+            else:
+                self.drop_reasons["NO_ROUTE_PHYSICAL_PARTITION"] += 1
 
             return TransmissionResult(
                 packet=packet,
@@ -782,6 +823,7 @@ class WSNSimulator:
                     )
 
                     self.dropped_packets += 1
+                    self.drop_reasons["TX_ENERGY_INSUFFICIENT"] += 1
 
                     return TransmissionResult(
                         packet=packet,
@@ -861,6 +903,7 @@ class WSNSimulator:
                     )
 
                     self.dropped_packets += 1
+                    self.drop_reasons["RX_ENERGY_INSUFFICIENT"] += 1
 
                     return TransmissionResult(
                         packet=packet,
@@ -927,6 +970,7 @@ class WSNSimulator:
                 packet.dropped_reason = "CRYPTO_AUTH_FAILED"
                 self.crypto_auth_failures += 1
                 self.dropped_packets += 1
+                self.drop_reasons["CRYPTO_AUTH_FAILURES"] += 1
 
                 return TransmissionResult(
                     packet=packet,
@@ -970,6 +1014,15 @@ class WSNSimulator:
         )
 
         self.delivered_packets += 1
+
+        if getattr(route, "detour_hops", 0) > 0:
+            self.total_detour_packets += 1
+        if getattr(route, "used_low_energy_fallback", False):
+            self.total_soft_fallback_packets += 1
+        if self.first_disconnection_round is None and self.fnd_round is None:
+            self.full_conn_delivered_packets += 1
+            self.full_conn_total_hops += packet.hop_count
+            self.full_conn_total_delay_ms += packet.delay_ms
 
         self.delivered_bytes += (
             packet.payload_size_bytes
@@ -1042,6 +1095,17 @@ class WSNSimulator:
                 self.transmit_from_sensor(
                     source_id
                 )
+
+            # Basal sensing / idle / beacon energy per active round
+            basal_j = self.idle_energy_per_round_j + self.beacon_energy_per_round_j
+            if basal_j > 0.0:
+                for sensor in self.network.sensors:
+                    if sensor.is_alive():
+                        self._consume_sensor_energy(
+                            sensor.node_id,
+                            basal_j,
+                            is_basal=True
+                        )
 
             self._update_lifetime_metrics()
 
@@ -1210,27 +1274,22 @@ class WSNSimulator:
         self
     ) -> set[int]:
 
-        graph = (
-            self.network.graph.copy()
-        )
-
-        dead_nodes = [
-            sensor.node_id
-            for sensor
-            in self.network.sensors
-            if not sensor.is_alive()
-        ]
-
-        graph.remove_nodes_from(
-            dead_nodes
-        )
-
         sink_id = (
             self.network.sink.node_id
         )
 
-        if sink_id not in graph:
+        if sink_id not in self.network.graph:
             return set()
+
+        alive_nodes = {
+            sensor.node_id
+            for sensor
+            in self.network.sensors
+            if sensor.is_alive()
+        }
+        alive_nodes.add(sink_id)
+
+        graph = self.network.graph.subgraph(alive_nodes)
 
         component = (
             nx.node_connected_component(
@@ -1278,7 +1337,6 @@ class WSNSimulator:
                 |
                 {sink_id}
             )
-            .copy()
         )
 
         if sink_id not in relay_graph:
@@ -1331,6 +1389,19 @@ class WSNSimulator:
 
         return connected
 
+    def _get_physical_connected_ids(
+        self
+    ) -> set[int]:
+        alive_ids = frozenset(
+            sensor.node_id
+            for sensor in self.network.sensors
+            if sensor.is_alive()
+        )
+        if getattr(self, "_cached_phys_alive_key", None) != alive_ids:
+            self._cached_phys_alive_key = alive_ids
+            self._cached_phys_conn_set = self._minimum_hop_connected_ids()
+        return self._cached_phys_conn_set
+
     def _ecmhr_connected_ids_for_threshold(
         self,
         threshold_ratio: float
@@ -1350,12 +1421,19 @@ class WSNSimulator:
         ):
 
             return (
-                self._minimum_hop_connected_ids()
+                self._get_physical_connected_ids()
             )
+
+        eff_threshold = self.energy_threshold_ratio
+        if (
+            hasattr(self, "route_manager")
+            and getattr(self.route_manager, "allow_low_energy_fallback", False)
+        ):
+            eff_threshold = self.route_manager.soft_energy_threshold_ratio
 
         return (
             self._energy_constrained_connected_ids_for_threshold(
-                self.energy_threshold_ratio
+                eff_threshold
             )
         )
 
@@ -1381,16 +1459,34 @@ class WSNSimulator:
             )
         )
 
+        soft_depleted_ids = frozenset(
+            sensor.node_id
+            for sensor
+            in self.network.sensors
+            if sensor.is_alive()
+            and hasattr(self, "route_manager")
+            and (
+                sensor.energy_ratio()
+                <= getattr(self.route_manager, "soft_energy_threshold_ratio", 0.01)
+            )
+        )
+
         state_key = (
             self.routing_algorithm,
+            getattr(self.route_manager, "allow_low_energy_fallback", False),
             alive_ids,
-            low_energy_ids
+            low_energy_ids,
+            soft_depleted_ids
         )
 
         if getattr(self, "_cached_connectivity_key", None) == state_key:
             return self._cached_connectivity_metrics
 
-        connected_ids = (
+        physical_connected_ids = (
+            self._get_physical_connected_ids()
+        )
+
+        routing_connected_ids = (
             self.get_connected_alive_sensor_ids()
         )
 
@@ -1398,37 +1494,47 @@ class WSNSimulator:
             alive_ids
         )
 
-        connected_count = len(
-            connected_ids
+        physical_connected_count = len(
+            physical_connected_ids
         )
 
-        disconnected_count = (
-            alive_count
-            -
-            connected_count
+        routing_connected_count = len(
+            routing_connected_ids
         )
 
-        if alive_count > 0:
+        physical_ratio = (
+            physical_connected_count / alive_count
+            if alive_count > 0
+            else 0.0
+        )
 
-            ratio = (
-                connected_count
-                /
-                alive_count
-            )
-
-        else:
-
-            ratio = 0.0
+        routing_ratio = (
+            routing_connected_count / alive_count
+            if alive_count > 0
+            else 0.0
+        )
 
         res = {
             "connected_alive_nodes":
-                connected_count,
+                routing_connected_count,
 
             "disconnected_alive_nodes":
-                disconnected_count,
+                alive_count - routing_connected_count,
 
             "connectivity_ratio":
-                ratio
+                routing_ratio,
+
+            "routing_connectivity_ratio":
+                routing_ratio,
+
+            "physical_connected_alive_nodes":
+                physical_connected_count,
+
+            "physical_disconnected_alive_nodes":
+                alive_count - physical_connected_count,
+
+            "physical_connectivity_ratio":
+                physical_ratio
         }
 
         self._cached_connectivity_key = state_key
@@ -1464,6 +1570,15 @@ class WSNSimulator:
                 "connectivity_ratio"
             ]
         )
+
+        total_nodes = len(self.network.sensors)
+
+        if (
+            total_nodes > 0
+            and connected < 0.50 * total_nodes
+            and self.functional_50_round is None
+        ):
+            self.functional_50_round = self.current_round
 
         if (
             alive > 0
@@ -1585,6 +1700,15 @@ class WSNSimulator:
         """
 
         snapshot = self.get_metrics().copy()
+
+        if self.history:
+            prev = self.history[-1]
+            assert snapshot["alive_nodes"] <= prev["alive_nodes"], (
+                f"Lỗi phi lý: alive_nodes tăng từ {prev['alive_nodes']} lên {snapshot['alive_nodes']} tại round {self.current_round}!"
+            )
+            assert snapshot["dead_nodes"] >= prev["dead_nodes"], (
+                f"Lỗi phi lý: dead_nodes giảm từ {prev['dead_nodes']} xuống {snapshot['dead_nodes']} tại round {self.current_round}!"
+            )
 
         self.history.append(
             snapshot
@@ -1727,18 +1851,60 @@ class WSNSimulator:
             )
         )
 
+        forwarding_loads = [
+            sensor.forwarded_packets
+            for sensor in self.network.sensors
+            if sensor.forwarded_packets > 0
+        ]
+        if forwarding_loads:
+            cum_mean = sum(forwarding_loads) / len(forwarding_loads)
+            cum_variance = sum((x - cum_mean) ** 2 for x in forwarding_loads) / len(forwarding_loads)
+            cum_cv = math.sqrt(cum_variance) / cum_mean if cum_mean > 0 else 0.0
+            cum_max = max(forwarding_loads)
+        else:
+            cum_mean = 0.0
+            cum_cv = None
+            cum_max = 0
+
+        # Cumulative load CV over ALL N sensors (fixed node set across algorithms)
+        all_loads = [sensor.forwarded_packets for sensor in self.network.sensors]
+        if all_loads and sum(all_loads) > 0:
+            all_mean = sum(all_loads) / len(all_loads)
+            all_var = sum((x - all_mean) ** 2 for x in all_loads) / len(all_loads)
+            cum_cv_all = math.sqrt(all_var) / all_mean if all_mean > 0 else 0.0
+        else:
+            cum_cv_all = None
+
+        # Cumulative load CV over the fixed 1-hop bottleneck ring around Sink
+        sink_id = self.network.sink.node_id
+        ring1_ids = (
+            list(self.network.graph.neighbors(sink_id))
+            if sink_id in self.network.graph
+            else []
+        )
+        ring1_loads = [
+            self.sensor_map[nid].forwarded_packets
+            for nid in ring1_ids
+            if nid in self.sensor_map
+        ]
+        if ring1_loads and sum(ring1_loads) > 0:
+            r1_mean = sum(ring1_loads) / len(ring1_loads)
+            r1_var = sum((x - r1_mean) ** 2 for x in ring1_loads) / len(ring1_loads)
+            cum_cv_1hop = math.sqrt(r1_var) / r1_mean if r1_mean > 0 else 0.0
+        else:
+            cum_cv_1hop = None
+
         load_metrics = {
             "overloaded_relay_count": 0,
-            "active_relay_count": 0,
-            "mean_relay_load": 0.0,
-            "max_relay_load": 0,
-            "relay_load_cv": 0.0
+            "active_relay_count": len(forwarding_loads),
+            "mean_relay_load": cum_mean,
+            "max_relay_load": cum_max,
+            "relay_load_cv": None,
+            "overload_transitions_count": 0,
+            "total_overload_node_rounds": 0
         }
 
-        if (
-            self.routing_algorithm == "lb_ecmhr"
-            and hasattr(self.route_manager, "load_tracker")
-        ):
+        if hasattr(self.route_manager, "load_tracker"):
             load_metrics = (
                 self.route_manager
                 .load_tracker
@@ -1775,6 +1941,17 @@ class WSNSimulator:
             )
         )
 
+        soft_fallback_route_count = sum(
+            1
+            for route
+            in route_results
+            if getattr(
+                route,
+                "used_low_energy_fallback",
+                False
+            )
+        )
+
         if route_results:
             average_max_relay_load = (
                 sum(
@@ -1791,6 +1968,23 @@ class WSNSimulator:
             )
         else:
             average_max_relay_load = 0.0
+
+        scheduled_packets = total_nodes * max(self.current_round, 1)
+        delivered_ratio_scheduled = (
+            self.delivered_packets / scheduled_packets
+            if scheduled_packets > 0
+            else 0.0
+        )
+        full_conn_avg_hop = (
+            self.full_conn_total_hops / self.full_conn_delivered_packets
+            if self.full_conn_delivered_packets > 0
+            else average_hop_count
+        )
+        full_conn_avg_delay_ms = (
+            self.full_conn_total_delay_ms / self.full_conn_delivered_packets
+            if self.full_conn_delivered_packets > 0
+            else average_delay_ms
+        )
 
         return {
             "round":
@@ -1839,6 +2033,9 @@ class WSNSimulator:
             "pdr":
                 pdr,
 
+            "delivered_ratio_scheduled":
+                delivered_ratio_scheduled,
+
             "throughput_bps":
                 throughput_bps,
 
@@ -1848,8 +2045,20 @@ class WSNSimulator:
             "average_hop_count":
                 average_hop_count,
 
+            "full_conn_avg_hop_count":
+                full_conn_avg_hop,
+
+            "full_conn_avg_delay_ms":
+                full_conn_avg_delay_ms,
+
             "total_energy_consumed_j":
                 self.total_energy_consumed_j,
+
+            "radio_energy_consumed_j":
+                self.radio_energy_consumed_j,
+
+            "basal_energy_consumed_j":
+                self.basal_energy_consumed_j,
 
             "total_remaining_energy_j":
                 total_remaining_energy,
@@ -1906,6 +2115,9 @@ class WSNSimulator:
             "delivered_data_mb":
                 delivered_data_mb,
 
+            "delivered_data_mib":
+                delivered_data_mb,
+
             "network_load_mb":
                 network_load_mb,
 
@@ -1927,7 +2139,22 @@ class WSNSimulator:
 
             "routing_connectivity_ratio":
                 connectivity[
-                    "connectivity_ratio"
+                    "routing_connectivity_ratio"
+                ],
+
+            "physical_connected_alive_nodes":
+                connectivity[
+                    "physical_connected_alive_nodes"
+                ],
+
+            "physical_disconnected_alive_nodes":
+                connectivity[
+                    "physical_disconnected_alive_nodes"
+                ],
+
+            "physical_connectivity_ratio":
+                connectivity[
+                    "physical_connectivity_ratio"
                 ],
 
             "first_disconnection_round":
@@ -1938,6 +2165,9 @@ class WSNSimulator:
 
             "connectivity_50_round":
                 self.connectivity_50_round,
+
+            "functional_50_round":
+                self.functional_50_round,
 
             "zero_connectivity_round":
                 self.zero_connectivity_round,
@@ -2003,11 +2233,76 @@ class WSNSimulator:
                     "relay_load_cv"
                 ],
 
+            "cumulative_relay_load_cv":
+                cum_cv,
+
+            "cumulative_relay_load_cv_all":
+                cum_cv_all,
+
+            "cumulative_relay_load_cv_1hop":
+                cum_cv_1hop,
+
+            "overload_transitions_count":
+                load_metrics.get(
+                    "overload_transitions_count",
+                    0
+                ),
+
+            "total_overload_node_rounds":
+                load_metrics.get(
+                    "total_overload_node_rounds",
+                    0
+                ),
+
+            "drop_source_dead":
+                self.drop_reasons[
+                    "SOURCE_DEAD"
+                ],
+
+            "drop_no_route":
+                self.drop_reasons[
+                    "NO_ROUTE"
+                ],
+
+            "drop_no_route_energy":
+                self.drop_reasons[
+                    "NO_ROUTE_ENERGY_THRESHOLD"
+                ],
+
+            "drop_no_route_partition":
+                self.drop_reasons[
+                    "NO_ROUTE_PHYSICAL_PARTITION"
+                ],
+
+            "drop_tx_energy":
+                self.drop_reasons[
+                    "TX_ENERGY_INSUFFICIENT"
+                ],
+
+            "drop_rx_energy":
+                self.drop_reasons[
+                    "RX_ENERGY_INSUFFICIENT"
+                ],
+
+            "drop_crypto_auth":
+                self.drop_reasons[
+                    "CRYPTO_AUTH_FAILURES"
+                ],
+
             "detour_route_count":
                 detour_route_count,
 
+            "total_detour_packets":
+                self.total_detour_packets,
+
             "overload_fallback_route_count":
                 overload_fallback_route_count,
+
+            "soft_fallback_route_count":
+                soft_fallback_route_count,
+
+            "total_soft_fallback_packets":
+                self.total_soft_fallback_packets,
 
             "average_route_max_relay_load":
                 average_max_relay_load,
@@ -2279,4 +2574,4 @@ class WSNSimulator:
                 f"Network TX {network_mb:.2f} MB"
             )
 
-        print("=" * 50)
+        print("=" * 50)

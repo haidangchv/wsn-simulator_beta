@@ -34,7 +34,8 @@ class RelayLoadTracker:
         self,
         window_rounds: int = 20,
         overload_factor: float = 2.0,
-        recovery_factor: float = 1.2
+        recovery_factor: float = 1.2,
+        hysteresis_enabled: bool = True
     ):
 
         if window_rounds <= 0:
@@ -42,10 +43,12 @@ class RelayLoadTracker:
                 "window_rounds must be > 0"
             )
 
-        if recovery_factor >= overload_factor:
+        self.hysteresis_enabled = bool(hysteresis_enabled)
+
+        if self.hysteresis_enabled and recovery_factor >= overload_factor:
             raise ValueError(
                 "recovery_factor must be "
-                "smaller than overload_factor"
+                "smaller than overload_factor when hysteresis is enabled"
             )
 
         self.window_rounds = int(
@@ -71,6 +74,8 @@ class RelayLoadTracker:
         self.load_factors = {}
 
         self.overloaded_nodes = set()
+        self.overload_transitions_count = 0
+        self.total_overload_node_rounds = 0
 
     def reset(self):
 
@@ -83,6 +88,8 @@ class RelayLoadTracker:
         self.load_factors.clear()
 
         self.overloaded_nodes.clear()
+        self.overload_transitions_count = 0
+        self.total_overload_node_rounds = 0
 
     def update(
         self,
@@ -232,9 +239,11 @@ class RelayLoadTracker:
 
             if not sensor.is_alive():
 
-                self.overloaded_nodes.discard(
-                    node_id
-                )
+                if node_id in self.overloaded_nodes:
+                    self.overloaded_nodes.discard(
+                        node_id
+                    )
+                    self.overload_transitions_count += 1
 
                 continue
 
@@ -245,35 +254,48 @@ class RelayLoadTracker:
                 )
             )
 
-            if (
-                node_id
-                in
-                self.overloaded_nodes
-            ):
-
-                # Chỉ phục hồi khi tải giảm
-                # đủ thấp.
-                if (
-                    load_factor
-                    <=
-                    self.recovery_factor
-                ):
-
-                    self.overloaded_nodes.discard(
-                        node_id
-                    )
-
+            if not self.hysteresis_enabled:
+                if load_factor >= self.overload_factor:
+                    if node_id not in self.overloaded_nodes:
+                        self.overloaded_nodes.add(node_id)
+                        self.overload_transitions_count += 1
+                else:
+                    if node_id in self.overloaded_nodes:
+                        self.overloaded_nodes.discard(node_id)
+                        self.overload_transitions_count += 1
             else:
-
                 if (
-                    load_factor
-                    >=
-                    self.overload_factor
+                    node_id
+                    in
+                    self.overloaded_nodes
                 ):
 
-                    self.overloaded_nodes.add(
-                        node_id
-                    )
+                    # Chỉ phục hồi khi tải giảm đủ thấp.
+                    if (
+                        load_factor
+                        <=
+                        self.recovery_factor
+                    ):
+
+                        self.overloaded_nodes.discard(
+                            node_id
+                        )
+                        self.overload_transitions_count += 1
+
+                else:
+
+                    if (
+                        load_factor
+                        >=
+                        self.overload_factor
+                    ):
+
+                        self.overloaded_nodes.add(
+                            node_id
+                        )
+                        self.overload_transitions_count += 1
+
+        self.total_overload_node_rounds += len(self.overloaded_nodes)
 
     def get_load_factor(
         self,
@@ -339,7 +361,13 @@ class RelayLoadTracker:
                     0,
 
                 "relay_load_cv":
-                    0.0
+                    0.0,
+
+                "overload_transitions_count":
+                    self.overload_transitions_count,
+
+                "total_overload_node_rounds":
+                    self.total_overload_node_rounds
             }
 
         mean_value = (
@@ -395,5 +423,11 @@ class RelayLoadTracker:
                 ),
 
             "relay_load_cv":
-                cv
+                cv,
+
+            "overload_transitions_count":
+                self.overload_transitions_count,
+
+            "total_overload_node_rounds":
+                self.total_overload_node_rounds
         }
